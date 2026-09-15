@@ -45,7 +45,9 @@ module ex_default_csr_avmm_slave(
    //newly added ports for CXL stall design
    output logic [63:0] csr_stall_addr,
    output logic        csr_stall_en,
-   output logic [15:0] csr_stall_cycles
+   output logic [15:0] csr_stall_cycles,
+   output logic [63:0] csr_stall_addr1,
+   input  logic [63:0] csr_occupancy
 );
 
 
@@ -75,6 +77,7 @@ always @(posedge clk) begin
         csr_stall_addr   <= 64'h0;
         csr_stall_en     <= 1'b0;
         csr_stall_cycles <= 16'd0;
+        csr_stall_addr1  <= 64'h0;
     end
     else begin
          if (write && (address == 22'h0000) && ~poison) begin 
@@ -87,6 +90,9 @@ always @(posedge clk) begin
             csr_stall_en     <= writedata[0];
             csr_stall_cycles <= writedata[16:1];
          end
+         else if (write && (address[21:0] == 22'h001010) && ~poison) begin
+            csr_stall_addr1 <= writedata;
+         end
          else begin
             csr_test_reg <= csr_test_reg;
          end
@@ -94,6 +100,7 @@ always @(posedge clk) begin
     end    
 end 
 
+//Read logic 
 always @(posedge clk) begin
     if (!reset_n) begin
         readdata <= 64'h0;
@@ -107,6 +114,10 @@ always @(posedge clk) begin
             readdata <= csr_stall_addr & mask;
         else if (address[21:0] == 22'h001008)
             readdata <= {47'h0, csr_stall_cycles, csr_stall_en} & mask;
+        else if (address[21:0] == 22'h001010)
+            readdata <= csr_stall_addr1 & mask;
+        else if (address[21:0] == 22'h001020)
+            readdata <= csr_occupancy & mask;
         else
             readdata <= 64'h0;
     end

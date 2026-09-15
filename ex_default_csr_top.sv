@@ -41,15 +41,13 @@ module ex_default_csr_top (
     input  logic [7:0]  csr_avmm_byteenable,
     output logic [63:0] csr_stall_addr,
     output logic        csr_stall_en,
-    output logic [15:0] csr_stall_cycles
+    output logic [15:0] csr_stall_cycles,
+    output logic [63:0] csr_stall_addr1,
+    input  logic [63:0] csr_occupancy
 );
 
 
 //CSR block
-
-
-  
-
    ex_default_csr_avmm_slave ex_default_csr_avmm_slave_inst(
        .clk          (csr_avmm_clk),
        .reset_n      (csr_avmm_rstn),
@@ -64,8 +62,10 @@ module ex_default_csr_top (
        .waitrequest  (csr_avmm_waitrequest),
        .csr_stall_addr(csr_stall_addr),
        .csr_stall_en (csr_stall_en),
-       .csr_stall_cycles(csr_stall_cycles)
-
+       .csr_stall_cycles(csr_stall_cycles),
+       .csr_stall_addr1(csr_stall_addr1),
+       .csr_occupancy  (csr_occupancy)
+    
    );
 
 //USER LOGIC Implementation 

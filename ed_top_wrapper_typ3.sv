@@ -499,8 +499,12 @@ module ed_top_wrapper_typ3 (
     logic [15:0] sig_stall_cycles;
     logic [63:0] stall_addr_sync;
     
-logic [15:0] stall_cycles_sync;
-logic        stall_en_meta, stall_en_sync;
+    logic [15:0] stall_cycles_sync;
+    logic        stall_en_meta, stall_en_sync;
+    logic [63:0] sig_stall_addr1;
+    logic [63:0] stall_addr1_sync;
+    logic [63:0] sig_occupancy;
+    logic [63:0] occ_meta, occ_sync;
 
 //AXI signals are not part of edwrapper i/o 
 // AXI-MM interface - write address channel
@@ -1235,7 +1239,18 @@ end
 
 always_ff @(posedge ip2hdm_clk) begin
     stall_addr_sync   <= sig_stall_addr;
+    stall_addr1_sync  <= sig_stall_addr1;
     stall_cycles_sync <= sig_stall_cycles;
+end
+
+always_ff @(posedge ip2csr_avmm_clk) begin
+    if (!ip2csr_avmm_rstn) begin
+        occ_meta <= 64'h0;
+        occ_sync <= 64'h0;
+    end else begin
+        occ_meta <= sig_occupancy;
+        occ_sync <= occ_meta;
+    end
 end
 
 //User can implement the logic based on the queisce signal
@@ -1890,20 +1905,24 @@ ex_default_csr_top ex_default_csr_top_inst(
     .csr_avmm_byteenable    ( ip2csr_avmm_byteenable    ),
     .csr_stall_addr         ( sig_stall_addr            ),
     .csr_stall_en           ( sig_stall_en              ),
-    .csr_stall_cycles       ( sig_stall_cycles          )
+    .csr_stall_cycles       ( sig_stall_cycles          ),
+    .csr_stall_addr1        ( sig_stall_addr1           ),
+    .csr_occupancy          ( occ_sync                  )
 );
 
 
  afu_top afu_top_inst(
-    .afu_clk                             ( ip2hdm_clk                          ),
-    .afu_rstn                            ( ip2hdm_reset_n_f                    ),
-       .cxlip2iafu_to_mc_axi4            ( cxlip2iafu_to_mc_axi4    ), //( cxlip2iafu_to_mc_axi4[(2*chanCount+ONE_OR_ZERO):(2*chanCount)]    ), //cxlip2iafu_to_mc_axi4 
-       .iafu2mc_to_mc_axi4               ( iafu2mc_to_mc_axi4       ), //( cxlip2iafu_to_mc_axi4[(2*chanCount+ONE_OR_ZERO):(2*chanCount)]    ), //cxlip2iafu_to_mc_axi4 
-       .mc2iafu_from_mc_axi4             ( mc2iafu_from_mc_axi4     ), //( iafu2cxlip_from_mc_axi4[(2*chanCount+ONE_OR_ZERO):(2*chanCount)]  ), //iafu2cxlip_from_mc_axi4
-       .iafu2cxlip_from_mc_axi4          ( iafu2cxlip_from_mc_axi4  ),  //( iafu2cxlip_from_mc_axi4[(2*chanCount+ONE_OR_ZERO):(2*chanCount)]  ), //iafu2cxlip_from_mc_axi4
-       .csr_stall_addr   (stall_addr_sync),
-       .csr_stall_en     (stall_en_sync),
-       .csr_stall_cycles (stall_cycles_sync)
+        .afu_clk                             ( ip2hdm_clk                          ),
+        .afu_rstn                            ( ip2hdm_reset_n_f                    ),
+        .cxlip2iafu_to_mc_axi4            ( cxlip2iafu_to_mc_axi4    ), //( cxlip2iafu_to_mc_axi4[(2*chanCount+ONE_OR_ZERO):(2*chanCount)]    ), //cxlip2iafu_to_mc_axi4 
+        .iafu2mc_to_mc_axi4               ( iafu2mc_to_mc_axi4       ), //( cxlip2iafu_to_mc_axi4[(2*chanCount+ONE_OR_ZERO):(2*chanCount)]    ), //cxlip2iafu_to_mc_axi4 
+        .mc2iafu_from_mc_axi4             ( mc2iafu_from_mc_axi4     ), //( iafu2cxlip_from_mc_axi4[(2*chanCount+ONE_OR_ZERO):(2*chanCount)]  ), //iafu2cxlip_from_mc_axi4
+        .iafu2cxlip_from_mc_axi4          ( iafu2cxlip_from_mc_axi4  ),  //( iafu2cxlip_from_mc_axi4[(2*chanCount+ONE_OR_ZERO):(2*chanCount)]  ), //iafu2cxlip_from_mc_axi4
+        .csr_stall_addr   (stall_addr_sync),
+        .csr_stall_en     (stall_en_sync),
+        .csr_stall_cycles (stall_cycles_sync),
+        .csr_stall_addr1  (stall_addr1_sync),
+        .csr_occupancy    (sig_occupancy)
  );
 
 

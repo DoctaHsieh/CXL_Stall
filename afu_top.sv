@@ -39,6 +39,8 @@ module afu_top(
     input  logic [63:0]                                      csr_stall_addr,
     input  logic                                             csr_stall_en,
     input  logic [15:0]                                      csr_stall_cycles,
+    input  logic [63:0]                                      csr_stall_addr1,
+    output logic [63:0]                                      csr_occupancy,
   `ifdef OOORSP_MC_AXI2AVMM 
      // April 2023 - Supporting out of order responses with AXI4
       input mc_axi_if_pkg::t_to_mc_axi4    [MC_CHANNEL-1:0] cxlip2iafu_to_mc_axi4,
@@ -119,6 +121,10 @@ module afu_top(
       logic        stall_done    [MC_CHANNEL];
       logic        ar_match      [MC_CHANNEL];
       logic        force_stall   [MC_CHANNEL];
+      logic [15:0] stall_events  [MC_CHANNEL];
+      logic [MC_CHANNEL-1:0] stall_active;
+      logic [3:0]  concurrent_now;
+      logic [3:0]  max_concurrent;
 
       // AXI Struct Combinatorial Override & Match Logic
       always_comb begin
@@ -128,8 +134,9 @@ module afu_top(
 
           for (int i = 0; i < MC_CHANNEL; i++) begin
               // 1. Check if this channel's read address matches the CSR target
-              ar_match[i] = csr_stall_en && (cxlip2iafu_to_mc_axi4[i].araddr == csr_stall_addr);
-
+              ar_match[i] = csr_stall_en && 
+                (((cxlip2iafu_to_mc_axi4[i].araddr >> 6) == (csr_stall_addr  >> 6)) || 
+                ((cxlip2iafu_to_mc_axi4[i].araddr >> 6) == (csr_stall_addr1 >> 6)));
               // 2. Force stall if currently counting, OR if matched but haven't finished stalling
               force_stall[i] = stalling[i] || (ar_match[i] && cxlip2iafu_to_mc_axi4[i].arvalid && !stall_done[i]);
 
@@ -176,7 +183,45 @@ module afu_top(
               end
           end
       end
+
+      always_comb begin
+          stall_active   = '0;
+          concurrent_now = '0;
+          for (int i = 0; i < MC_CHANNEL; i++) begin
+              stall_active[i] = stalling[i];
+              if (stalling[i]) concurrent_now = concurrent_now + 4'd1;
+          end
+      end
+
+      always_comb begin
+          csr_occupancy = 64'h0;
+          csr_occupancy[MC_CHANNEL-1:0] = stall_active;
+          csr_occupancy[11:8]           = max_concurrent;
+          for (int i = 0; i < (MC_CHANNEL > 2 ? 2 : MC_CHANNEL); i++)
+              csr_occupancy[(16*i)+16 +: 16] = stall_events[i];
+      end
+
+      always_ff @(posedge afu_clk or negedge afu_rstn) begin
+          if (!afu_rstn) begin
+              max_concurrent <= '0;
+              for (int i = 0; i < MC_CHANNEL; i++) stall_events[i] <= '0;
+          end
+          else if (!csr_stall_en) begin        // software clears by disarming
+              max_concurrent <= '0;
+              for (int i = 0; i < MC_CHANNEL; i++) stall_events[i] <= '0;
+          end
+          else begin
+              if (concurrent_now > max_concurrent)
+                  max_concurrent <= concurrent_now;
+              for (int i = 0; i < MC_CHANNEL; i++) begin
+                  if (!stalling[i] && !stall_done[i] && ar_match[i] &&
+                      cxlip2iafu_to_mc_axi4[i].arvalid)
+                      stall_events[i] <= stall_events[i] + 16'd1;
+              end
+          end
+      end
 `else
+assign csr_occupancy = 64'h0;
 assign iafu2cxlip_ready_eclk                = mc2iafu_ready_eclk             ;
 assign iafu2cxlip_read_poison_eclk          = mc2iafu_read_poison_eclk       ;
 assign iafu2cxlip_readdatavalid_eclk        = mc2iafu_readdatavalid_eclk     ;

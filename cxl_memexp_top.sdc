@@ -269,6 +269,10 @@ set_max_delay -to [get_keepers -nowarn {*stall_addr_sync*}]   100
 set_min_delay -to [get_keepers -nowarn {*stall_addr_sync*}]  -100
 set_max_delay -to [get_keepers -nowarn {*stall_cycles_sync*}] 100
 set_min_delay -to [get_keepers -nowarn {*stall_cycles_sync*}] -100
+set_max_delay -to [get_keepers -nowarn {*stall_addr1_sync*}]  100
+set_min_delay -to [get_keepers -nowarn {*stall_addr1_sync*}] -100
+set_max_delay -to [get_keepers -nowarn {*occ_meta*}]          100
+set_min_delay -to [get_keepers -nowarn {*occ_meta*}]         -100
 #-----------------------------------------------
 # Overconstraint specific paths during Placement & Routing
 #-----------------------------------------------

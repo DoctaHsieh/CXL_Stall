@@ -1,30 +1,38 @@
 /*
- * test_stall_numa.c - arm the CXL read-stall against a real, owned buffer
- *                     in CXL memory (NUMA node, mode=ram).
+ * test_stall.c - drive two concurrent stalls and read the occupancy CSR.
  *
- * Build: gcc -O2 -o test_stall_numa test_stall_numa.c
- * Run:   sudo ./test_stall_numa [options]
+ * Build: gcc -O2 -pthread -o test_stall test_stall.c
+ * Run:   sudo ./test_stall [options]
  *
- *   --bdf    <bdf>    CSR function          (default 0000:40:00.1)
- *   --base   <hex>    CXL HPA base          (default 8080000000)
- *   --size   <hex>    CXL window size       (default 400000000)
- *   --cycles <n>      stall cycles, 1-65535 (default 8000)
- *   --offset <hex>    byte offset into the test buffer (default 0)
- *   --hold            stay armed until you press Enter
- *   --disarm          clear the stall and exit
+ *   --bdf    <bdf>   CSR function            (default 0000:40:00.1)
+ *   --base   <hex>   CXL HPA base            (default 8080000000)
+ *   --size   <hex>   CXL window size         (default 400000000)
+ *   --cycles <n>     stall cycles 1-65535    (default 8000)
+ *   --ms     <n>     hammer duration per pair in ms (default 200)
+ *   --pairs  <n>     how many address pairs to try   (default 8)
+ *   --single         also run the single-address regression check first
+ *   --disarm         clear the stall and exit
  *
- * Calibration result this is built on: araddr carries the RAW host physical
- * address. No HDM base subtraction, no interleave transform. So the value
- * written to csr_stall_addr is just the 64B-aligned HPA of the target line.
+ * Why two threads: a single thread issues one load at a time, so it can
+ * never have two reads outstanding. Occupancy would cap at 1 no matter how
+ * the addresses map. Two threads pinned to separate cores can.
  *
- * CSR map (ex_default_csr_avmm_slave.sv), PF1 BAR2:
- *   0x1000 : csr_stall_addr (64-bit)
- *   0x1008 : bit0 = csr_stall_en, bits 16:1 = csr_stall_cycles
+ * Why a pair sweep: the stall works by holding arready low, which is
+ * backpressure on a whole AXI port. Two addresses on the SAME channel
+ * cannot stall concurrently -- the first blocks the port and the second
+ * request never reaches the comparator. Only a pair that lands on
+ * DIFFERENT channels can produce occupancy 2. The channel mapping is
+ * unknown, so we try several pairs and report which one works.
  *
- * IMPORTANT: the stall targets a physical address. This program keeps the
- * backing page allocated and locked for as long as the stall is armed, and
- * disarms on exit and on SIGINT/SIGTERM. Do not arm and then exit -- the
- * kernel would be free to reuse that frame while the FPGA still stalls it.
+ * CSR map (PF1 BAR2):
+ *   0x1000 csr_stall_addr   RW
+ *   0x1008 bit0 en, bits16:1 cycles   RW
+ *   0x1010 csr_stall_addr1  RW   (new)
+ *   0x1020 occupancy        RO   (new)
+ *            [1:0]   per-channel stalling now
+ *            [11:8]  max concurrent seen (sticky, clears when en=0)
+ *            [31:16] ch0 stall events
+ *            [47:32] ch1 stall events
  */
 
 #define _GNU_SOURCE
@@ -38,18 +46,20 @@
 #include <signal.h>
 #include <dirent.h>
 #include <sched.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <x86intrin.h>
 
-#define CSR_STALL_ADDR 0x1000
-#define CSR_STALL_CTRL 0x1008
-#define CSR_MAP_LEN    0x2000
+#define CSR_ADDR0  0x1000
+#define CSR_CTRL   0x1008
+#define CSR_ADDR1  0x1010
+#define CSR_OCC    0x1020
+#define CSR_MAP    0x2000
 
 #define PAGE_SZ    4096
-#define BUF_PAGES  512          /* 2 MB */
+#define BUF_PAGES  2048          /* 8 MB, gives plenty of distinct frames */
 #define REPS       128
-#define LINE_MASK  (~63ULL)     /* araddr arrives 64B aligned */
 
 #define MPOL_BIND      2
 #define MPOL_MF_MOVE   (1<<1)
@@ -63,34 +73,46 @@ static void stall_disarm(void)
 {
     if (!g_csr)
         return;
-    *(volatile uint64_t *)(g_csr + CSR_STALL_CTRL) = 0;
+    *(volatile uint64_t *)(g_csr + CSR_CTRL) = 0;
     _mm_sfence();
 }
 
 static void on_signal(int sig)
 {
     stall_disarm();
-    fprintf(stderr, "\nsignal %d: stall disarmed.\n", sig);
+    fprintf(stderr, "\nsignal %d: disarmed.\n", sig);
     _exit(128 + sig);
 }
 
-static void stall_arm(uint64_t hpa, uint16_t cycles)
+static void stall_arm2(uint64_t a0, uint64_t a1, uint16_t cycles)
 {
-    *(volatile uint64_t *)(g_csr + CSR_STALL_ADDR) = hpa;
+    /* Addresses first, then the enable. Arming before the targets are
+     * stable could briefly match the wrong line. */
+    *(volatile uint64_t *)(g_csr + CSR_ADDR0) = a0;
+    *(volatile uint64_t *)(g_csr + CSR_ADDR1) = a1;
     _mm_sfence();
-    *(volatile uint64_t *)(g_csr + CSR_STALL_CTRL) =
-        ((uint64_t)cycles << 1) | 1ULL;
+    *(volatile uint64_t *)(g_csr + CSR_CTRL) = ((uint64_t)cycles << 1) | 1ULL;
     _mm_sfence();
     usleep(200);
 }
 
-static void stall_readback(uint64_t *addr, uint16_t *cyc, int *en)
+static uint64_t read_occ(void)
 {
-    uint64_t a = *(volatile uint64_t *)(g_csr + CSR_STALL_ADDR);
-    uint64_t c = *(volatile uint64_t *)(g_csr + CSR_STALL_CTRL);
-    *addr = a;
-    *en   = (int)(c & 1);
-    *cyc  = (uint16_t)((c >> 1) & 0xFFFF);
+    uint64_t v = *(volatile uint64_t *)(g_csr + CSR_OCC);
+    _mm_lfence();
+    return v;
+}
+
+static void print_occ(const char *tag, uint64_t occ)
+{
+    printf("  %s occ=0x%016llx  active=%llu%llu  max_concurrent=%llu  "
+           "ch0_events=%llu  ch1_events=%llu\n",
+           tag, (unsigned long long)occ,
+           (unsigned long long)((occ >> 1) & 1),
+           (unsigned long long)(occ & 1),
+           (unsigned long long)((occ >> 8) & 0xF),
+           (unsigned long long)((occ >> 16) & 0xFFFF),
+           (unsigned long long)((occ >> 32) & 0xFFFF));
 }
 
 static volatile uint8_t *map_csr(const char *bdf)
@@ -105,7 +127,7 @@ static volatile uint8_t *map_csr(const char *bdf)
         fprintf(stderr, "open(%s): %s\n", path, strerror(errno));
         return NULL;
     }
-    p = mmap(NULL, CSR_MAP_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    p = mmap(NULL, CSR_MAP, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (p == MAP_FAILED) {
         fprintf(stderr, "mmap CSR: %s\n", strerror(errno));
@@ -137,14 +159,13 @@ static int cmp_u64(const void *x, const void *y)
     return (a > b) - (a < b);
 }
 
-static uint64_t measure(volatile uint8_t *p, uint64_t *median_out)
+static uint64_t measure(volatile uint8_t *p)
 {
     static uint64_t s[REPS];
     int i;
 
     for (i = 0; i < REPS; i++) {
         uint64_t t0, t1, v;
-
         _mm_clflush((const void *)p);
         _mm_mfence();
         t0 = tsc_begin();
@@ -154,12 +175,10 @@ static uint64_t measure(volatile uint8_t *p, uint64_t *median_out)
         s[i] = t1 - t0;
     }
     qsort(s, REPS, sizeof(s[0]), cmp_u64);
-    if (median_out)
-        *median_out = s[REPS / 2];
     return s[0];
 }
 
-/* ---------------- physical addresses ---------------- */
+/* ---------------- pagemap / NUMA ---------------- */
 
 static int pagemap_fd = -1;
 
@@ -183,12 +202,9 @@ static uint64_t virt_to_phys(void *va)
     return (pfn * PAGE_SZ) + ((uintptr_t)va % PAGE_SZ);
 }
 
-/* ---------------- NUMA ---------------- */
-
 static int mbind_to_node(void *addr, size_t len, int node)
 {
     unsigned long mask[16];
-
     memset(mask, 0, sizeof(mask));
     mask[node / (8 * sizeof(unsigned long))] |=
         1UL << (node % (8 * sizeof(unsigned long)));
@@ -205,11 +221,8 @@ static int max_numa_node(void)
 
     if (!d)
         return -1;
-    while ((e = readdir(d))) {
-        int n;
-        if (sscanf(e->d_name, "node%d", &n) == 1 && n > max)
-            max = n;
-    }
+    while ((e = readdir(d)))
+        { int n; if (sscanf(e->d_name, "node%d", &n) == 1 && n > max) max = n; }
     closedir(d);
     return max;
 }
@@ -243,46 +256,100 @@ static int find_cxl_node(uint64_t base, uint64_t size)
     return -1;
 }
 
+/* ---------------- hammer threads ---------------- */
+
+struct hammer {
+    volatile uint8_t *addr;
+    volatile int     *run;
+    int               cpu;
+    uint64_t          iters;
+};
+
+static void *hammer_fn(void *arg)
+{
+    struct hammer *h = (struct hammer *)arg;
+    cpu_set_t set;
+
+    CPU_ZERO(&set);
+    CPU_SET(h->cpu, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+
+    while (*h->run) {
+        uint64_t v;
+        _mm_clflush((const void *)h->addr);
+        _mm_mfence();
+        v = *(volatile uint64_t *)h->addr;
+        __asm__ __volatile__("" :: "r"(v));
+        h->iters++;
+    }
+    return NULL;
+}
+
+/* Run both threads against a0/a1 for ms milliseconds, return final occupancy. */
+static uint64_t run_pair(volatile uint8_t *va0, volatile uint8_t *va1,
+                         uint64_t pa0, uint64_t pa1,
+                         uint16_t cycles, int ms)
+{
+    pthread_t t0, t1;
+    struct hammer h0, h1;
+    volatile int run = 1;
+    uint64_t occ;
+
+    /* Disarm first so the sticky counters clear, then arm on this pair. */
+    stall_disarm();
+    usleep(2000);
+    stall_arm2(pa0, pa1, cycles);
+
+    memset(&h0, 0, sizeof(h0));
+    memset(&h1, 0, sizeof(h1));
+    h0.addr = va0; h0.run = &run; h0.cpu = 0;
+    h1.addr = va1; h1.run = &run; h1.cpu = 1;
+
+    pthread_create(&t0, NULL, hammer_fn, &h0);
+    pthread_create(&t1, NULL, hammer_fn, &h1);
+
+    usleep((useconds_t)ms * 1000);
+    run = 0;
+    pthread_join(t0, NULL);
+    pthread_join(t1, NULL);
+
+    occ = read_occ();
+    stall_disarm();
+    return occ;
+}
+
 /* ---------------- main ---------------- */
 
 int main(int argc, char **argv)
 {
     const char *bdf = "0000:40:00.1";
-    uint64_t base = 0x8080000000ULL;
-    uint64_t size = 0x400000000ULL;
-    uint64_t buf_off = 0, hpa = 0, target_hpa;
-    unsigned cycles = 8000;
-    int hold = 0, do_disarm = 0;
-    int node, i;
+    uint64_t base = 0x8080000000ULL, size = 0x400000000ULL;
+    unsigned cycles = 8000, ms = 200, npairs = 8;
+    int do_single = 0, do_disarm = 0;
+    int node, i, found = -1;
     void *buf;
-    volatile uint8_t *target = NULL;
-    uint64_t b_min, b_med, a_min, a_med, rb_addr;
-    uint16_t rb_cyc;
-    int rb_en;
+    volatile uint8_t **va;
+    uint64_t *pa;
+    int ncand = 0;
 
     for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--bdf") && i + 1 < argc)
-            bdf = argv[++i];
+        if (!strcmp(argv[i], "--bdf") && i + 1 < argc) bdf = argv[++i];
         else if (!strcmp(argv[i], "--base") && i + 1 < argc)
             base = strtoull(argv[++i], NULL, 16);
         else if (!strcmp(argv[i], "--size") && i + 1 < argc)
             size = strtoull(argv[++i], NULL, 16);
         else if (!strcmp(argv[i], "--cycles") && i + 1 < argc)
             cycles = (unsigned)strtoul(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "--offset") && i + 1 < argc)
-            buf_off = strtoull(argv[++i], NULL, 16);
-        else if (!strcmp(argv[i], "--hold"))
-            hold = 1;
-        else if (!strcmp(argv[i], "--disarm"))
-            do_disarm = 1;
-        else {
-            fprintf(stderr, "unknown option: %s\n", argv[i]);
-            return 1;
-        }
+        else if (!strcmp(argv[i], "--ms") && i + 1 < argc)
+            ms = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--pairs") && i + 1 < argc)
+            npairs = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--single")) do_single = 1;
+        else if (!strcmp(argv[i], "--disarm")) do_disarm = 1;
+        else { fprintf(stderr, "unknown option: %s\n", argv[i]); return 1; }
     }
-
     if (cycles > 65535) {
-        fprintf(stderr, "cycles must be <= 65535 (16-bit CSR field)\n");
+        fprintf(stderr, "cycles must be <= 65535\n");
         return 1;
     }
 
@@ -295,117 +362,133 @@ int main(int argc, char **argv)
 
     if (do_disarm) {
         stall_disarm();
-        printf("stall disarmed.\n");
+        printf("disarmed.\n");
         return 0;
     }
-
     if (geteuid() != 0) {
-        fprintf(stderr, "must run as root (pagemap returns zeroed PFNs otherwise)\n");
+        fprintf(stderr, "must run as root (pagemap)\n");
         return 1;
     }
 
-    /* Confirm the CSR is live before trusting anything downstream. */
+    /* Verify both address registers exist. 0x1010 only responds on the
+     * new bitstream; on the old one it reads back as zero. */
     {
-        uint64_t rb;
-        *(volatile uint64_t *)(g_csr + CSR_STALL_ADDR) = 0x5A5AA5A5DEADBEEFULL;
+        uint64_t r0, r1;
+        *(volatile uint64_t *)(g_csr + CSR_ADDR0) = 0xA5A5DEADBEEF0000ULL;
+        *(volatile uint64_t *)(g_csr + CSR_ADDR1) = 0x5A5AFEEDFACE1111ULL;
         _mm_sfence();
-        usleep(50);
-        rb = *(volatile uint64_t *)(g_csr + CSR_STALL_ADDR);
-        *(volatile uint64_t *)(g_csr + CSR_STALL_ADDR) = 0;
+        usleep(100);
+        r0 = *(volatile uint64_t *)(g_csr + CSR_ADDR0);
+        r1 = *(volatile uint64_t *)(g_csr + CSR_ADDR1);
+        *(volatile uint64_t *)(g_csr + CSR_ADDR0) = 0;
+        *(volatile uint64_t *)(g_csr + CSR_ADDR1) = 0;
         _mm_sfence();
-        if (rb != 0x5A5AA5A5DEADBEEFULL) {
+
+        if (r0 != 0xA5A5DEADBEEF0000ULL) {
+            fprintf(stderr, "0x1000 did not read back -- check --bdf\n");
+            return 1;
+        }
+        if (r1 != 0x5A5AFEEDFACE1111ULL) {
             fprintf(stderr,
-                "CSR 0x1000 did not read back (got 0x%llx).\n"
-                "CSRs are on PF1 BAR2 -- check --bdf.\n",
-                (unsigned long long)rb);
+                "0x1010 did not read back (got 0x%llx).\n"
+                "This bitstream does not have the second address register.\n",
+                (unsigned long long)r1);
             return 1;
         }
     }
-    printf("CSR alive on %s BAR2\n", bdf);
+    printf("CSR alive: 0x1000 and 0x1010 both read back on %s BAR2\n", bdf);
 
     node = find_cxl_node(base, size);
     if (node < 0) {
-        fprintf(stderr, "no NUMA node backs [0x%llx, 0x%llx)\n",
-                (unsigned long long)base,
-                (unsigned long long)(base + size));
+        fprintf(stderr, "no NUMA node backs the CXL window\n");
         return 1;
     }
     printf("CXL memory is NUMA node %d\n", node);
 
     buf = mmap(NULL, (size_t)BUF_PAGES * PAGE_SZ, PROT_READ | PROT_WRITE,
                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (buf == MAP_FAILED) {
-        perror("mmap");
-        return 1;
-    }
+    if (buf == MAP_FAILED) { perror("mmap"); return 1; }
     if (mbind_to_node(buf, (size_t)BUF_PAGES * PAGE_SZ, node) != 0) {
-        perror("mbind");
-        return 1;
+        perror("mbind"); return 1;
     }
     memset(buf, 0xA5, (size_t)BUF_PAGES * PAGE_SZ);
     if (mlock(buf, (size_t)BUF_PAGES * PAGE_SZ) != 0)
-        perror("mlock (continuing, but pages may migrate)");
+        perror("mlock (continuing)");
 
-    /* Find a page that actually landed in CXL memory. */
+    /* Collect candidate lines that really landed in CXL memory. */
+    va = calloc(BUF_PAGES, sizeof(*va));
+    pa = calloc(BUF_PAGES, sizeof(*pa));
+    if (!va || !pa) { perror("calloc"); return 1; }
+
     for (i = 0; i < BUF_PAGES; i++) {
-        void *va = (uint8_t *)buf + (size_t)i * PAGE_SZ;
-        uint64_t pa = virt_to_phys(va);
-
-        if (pa >= base && pa < base + size) {
-            target = (volatile uint8_t *)va + (buf_off % PAGE_SZ);
-            hpa = pa + (buf_off % PAGE_SZ);
-            break;
+        void *p = (uint8_t *)buf + (size_t)i * PAGE_SZ;
+        uint64_t phys = virt_to_phys(p);
+        if (phys >= base && phys < base + size) {
+            va[ncand] = (volatile uint8_t *)p;
+            pa[ncand] = phys;
+            ncand++;
         }
     }
-    if (!target) {
-        fprintf(stderr, "no allocated page landed in CXL range\n");
+    printf("%d candidate pages in CXL range\n\n", ncand);
+    if (ncand < 2) {
+        fprintf(stderr, "need at least 2 pages in CXL range\n");
         return 1;
     }
 
-    target_hpa = hpa & LINE_MASK;
-    printf("target: va %p  hpa 0x%llx  line 0x%llx\n",
-           (void *)target, (unsigned long long)hpa,
-           (unsigned long long)target_hpa);
+    if (do_single) {
+        uint64_t b, a;
+        printf("=== single-address regression check ===\n");
+        stall_disarm();
+        usleep(2000);
+        b = measure(va[0]);
+        stall_arm2(pa[0], 0, (uint16_t)cycles);
+        a = measure(va[0]);
+        stall_disarm();
+        printf("  before %llu  after %llu  -> %s\n\n",
+               (unsigned long long)b, (unsigned long long)a,
+               (a > b * 3) ? "STALL OK" : "NO STALL");
+    }
 
-    {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(0, &set);
-        sched_setaffinity(0, sizeof(set), &set);
+    printf("=== sweeping %u address pairs, %u ms each, %u stall cycles ===\n",
+           npairs, ms, cycles);
+    printf("looking for max_concurrent = 2 (two channels stalling at once)\n\n");
+
+    for (i = 0; i < (int)npairs && i + 1 < ncand; i++) {
+        uint64_t occ;
+        int idx0 = 0, idx1 = i + 1;
+        unsigned maxc;
+
+        occ = run_pair(va[idx0], va[idx1], pa[idx0], pa[idx1],
+                       (uint16_t)cycles, (int)ms);
+        maxc = (unsigned)((occ >> 8) & 0xF);
+
+        printf("pair %d: pa0 0x%llx  pa1 0x%llx  (xor 0x%llx)\n", i,
+               (unsigned long long)pa[idx0], (unsigned long long)pa[idx1],
+               (unsigned long long)(pa[idx0] ^ pa[idx1]));
+        print_occ("       ", occ);
+
+        if (maxc >= 2) {
+            printf("       *** TWO CONCURRENT STALLS ***\n");
+            if (found < 0)
+                found = i;
+        }
+        printf("\n");
     }
 
     stall_disarm();
-    usleep(2000);
-    b_min = measure(target, &b_med);
-    printf("\nbefore arming: min %llu  median %llu cycles\n",
-           (unsigned long long)b_min, (unsigned long long)b_med);
 
-    stall_arm(target_hpa, (uint16_t)cycles);
-    stall_readback(&rb_addr, &rb_cyc, &rb_en);
-    printf("armed: addr=0x%llx cycles=%u en=%d\n",
-           (unsigned long long)rb_addr, rb_cyc, rb_en);
-    if (rb_addr != target_hpa || !rb_en || rb_cyc != cycles)
-        printf("WARNING: readback differs from what was written\n");
-
-    a_min = measure(target, &a_med);
-    printf("after arming:  min %llu  median %llu cycles\n",
-           (unsigned long long)a_min, (unsigned long long)a_med);
-
-    if (a_min > b_min * 3)
-        printf("\nSTALL ACTIVE: %.1fx slower (+%llu cycles)\n",
-               (double)a_min / (double)b_min,
-               (unsigned long long)(a_min - b_min));
-    else
-        printf("\nNo stall detected. Check that --base matches "
-               "region2/resource.\n");
-
-    if (hold) {
-        printf("\nHolding armed. The buffer stays allocated and locked.\n"
-               "Press Enter to disarm and exit.\n");
-        getchar();
+    if (found >= 0) {
+        printf("Success: pair %d produced two concurrent stalls.\n", found);
+        printf("Those two addresses map to different AXI channels.\n");
+    } else {
+        printf("No pair reached max_concurrent = 2.\n"
+               "Possible reasons:\n"
+               "  - every pair tried landed on the same channel; raise --pairs\n"
+               "  - the stall window is too short to overlap; raise --cycles\n"
+               "  - occupancy is wired but never updated; check that\n"
+               "    ch0/ch1 event counts above are nonzero. If events are\n"
+               "    counting but max stays 1, that IS the head-of-line\n"
+               "    result: one port at a time, which is the known limit.\n");
     }
-
-    stall_disarm();
-    printf("disarmed.\n");
     return 0;
 }
