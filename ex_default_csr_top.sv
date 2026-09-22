@@ -27,7 +27,9 @@
 // EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 
-module ex_default_csr_top (
+module ex_default_csr_top
+  import afu_stall_pkg::*;
+(
     input  logic        csr_avmm_clk,
     input  logic        csr_avmm_rstn,  
     output logic        csr_avmm_waitrequest,  
@@ -39,11 +41,12 @@ module ex_default_csr_top (
     input  logic        csr_avmm_write,
     input  logic        csr_avmm_read, 
     input  logic [7:0]  csr_avmm_byteenable,
-    output logic [63:0] csr_stall_addr,
+    output logic [STALL_NUM_TARGETS-1:0][63:0] csr_stall_addr,
+    output logic [STALL_NUM_TARGETS-1:0]       csr_target_en,
     output logic        csr_stall_en,
     output logic [15:0] csr_stall_cycles,
-    output logic [63:0] csr_stall_addr1,
-    input  logic [63:0] csr_occupancy
+    input  logic [63:0] csr_status_ch0,
+    input  logic [63:0] csr_status_ch1
 );
 
 
@@ -60,11 +63,12 @@ module ex_default_csr_top (
        .address      ({10'h0,csr_avmm_address}),
        .poison       (csr_avmm_poison),
        .waitrequest  (csr_avmm_waitrequest),
-       .csr_stall_addr(csr_stall_addr),
-       .csr_stall_en (csr_stall_en),
+       .csr_stall_addr  (csr_stall_addr),
+       .csr_target_en   (csr_target_en),
+       .csr_stall_en    (csr_stall_en),
        .csr_stall_cycles(csr_stall_cycles),
-       .csr_stall_addr1(csr_stall_addr1),
-       .csr_occupancy  (csr_occupancy)
+       .csr_status_ch0  (csr_status_ch0),
+       .csr_status_ch1  (csr_status_ch1)
     
    );
 

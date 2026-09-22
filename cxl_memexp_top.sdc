@@ -269,10 +269,14 @@ set_max_delay -to [get_keepers -nowarn {*stall_addr_sync*}]   100
 set_min_delay -to [get_keepers -nowarn {*stall_addr_sync*}]  -100
 set_max_delay -to [get_keepers -nowarn {*stall_cycles_sync*}] 100
 set_min_delay -to [get_keepers -nowarn {*stall_cycles_sync*}] -100
-set_max_delay -to [get_keepers -nowarn {*stall_addr1_sync*}]  100
-set_min_delay -to [get_keepers -nowarn {*stall_addr1_sync*}] -100
-set_max_delay -to [get_keepers -nowarn {*occ_meta*}]          100
-set_min_delay -to [get_keepers -nowarn {*occ_meta*}]         -100
+set_max_delay -to [get_keepers -nowarn {*target_en_sync*}]    100
+set_min_delay -to [get_keepers -nowarn {*target_en_sync*}]   -100
+# status: ip2hdm_clk -> ip2csr_avmm_clk. Counters are sampled by
+# software; a skewed snapshot is acceptable, a timing failure is not.
+set_max_delay -to [get_keepers -nowarn {*status_ch0_meta*}]   100
+set_min_delay -to [get_keepers -nowarn {*status_ch0_meta*}]  -100
+set_max_delay -to [get_keepers -nowarn {*status_ch1_meta*}]   100
+set_min_delay -to [get_keepers -nowarn {*status_ch1_meta*}]  -100
 #-----------------------------------------------
 # Overconstraint specific paths during Placement & Routing
 #-----------------------------------------------

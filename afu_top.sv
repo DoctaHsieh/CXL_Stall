@@ -31,16 +31,18 @@
 `include "cxl_typ3ddr_ed_defines.svh.iv"
 
 import cxlip_top_pkg::*;
+import afu_stall_pkg::*;
 
 module afu_top(
     
     input  logic                                             afu_clk,
     input  logic                                             afu_rstn,
-    input  logic [63:0]                                      csr_stall_addr,
+    input  logic [STALL_NUM_TARGETS-1:0][63:0]               csr_stall_addr,
+    input  logic [STALL_NUM_TARGETS-1:0]                     csr_target_en,
     input  logic                                             csr_stall_en,
     input  logic [15:0]                                      csr_stall_cycles,
-    input  logic [63:0]                                      csr_stall_addr1,
-    output logic [63:0]                                      csr_occupancy,
+    output logic [63:0]                                      csr_status_ch0,
+    output logic [63:0]                                      csr_status_ch1,
   `ifdef OOORSP_MC_AXI2AVMM 
      // April 2023 - Supporting out of order responses with AXI4
       input mc_axi_if_pkg::t_to_mc_axi4    [MC_CHANNEL-1:0] cxlip2iafu_to_mc_axi4,
@@ -115,113 +117,83 @@ module afu_top(
 
 //Passthrough User can implement the AFU logic here 
   `ifdef OOORSP_MC_AXI2AVMM 
-    // Arrays to track state independently across all channels
-      logic [15:0] stall_counter [MC_CHANNEL];
-      logic        stalling      [MC_CHANNEL];
-      logic        stall_done    [MC_CHANNEL];
-      logic        ar_match      [MC_CHANNEL];
-      logic        force_stall   [MC_CHANNEL];
-      logic [15:0] stall_events  [MC_CHANNEL];
-      logic [MC_CHANNEL-1:0] stall_active;
-      logic [3:0]  concurrent_now;
-      logic [3:0]  max_concurrent;
+    // ---------------------------------------------------------------
+    // Per-channel stall engines.
+    //
+    // Each engine accepts every AR beat it has room for, diverting
+    // matching addresses into its own queue and letting everything
+    // else pass. arready is no longer driven by the address match, so
+    // several addresses on one channel can be stalled at once.
+    // ---------------------------------------------------------------
+      logic [7:0]  eng_occ    [MC_CHANNEL];
+      logic [7:0]  eng_max    [MC_CHANNEL];
+      logic [15:0] eng_events [MC_CHANNEL];
+      logic        eng_full   [MC_CHANNEL];
+      logic        eng_byp    [MC_CHANNEL];
+      logic [7:0]  eng_arid   [MC_CHANNEL];
+      logic [15:0] eng_confl  [MC_CHANNEL];
 
-      // AXI Struct Combinatorial Override & Match Logic
-      always_comb begin
-          // Default: Pass everything through normally
-          iafu2mc_to_mc_axi4      = cxlip2iafu_to_mc_axi4;
-          iafu2cxlip_from_mc_axi4 = mc2iafu_from_mc_axi4;
+      generate
+        for (genvar ch = 0; ch < MC_CHANNEL; ch++) begin : g_stall_engine
+          afu_stall_engine #(
+            .NUM_TARGETS    (STALL_NUM_TARGETS),
+            .FIFO_DEPTH     (STALL_FIFO_DEPTH ),
+            .TIMEOUT_CYCLES (STALL_TIMEOUT    ),
+            .ADDR_LSB       (STALL_ADDR_LSB   )
+          ) u_engine (
+            .clk              ( afu_clk                    ),
+            .rstn             ( afu_rstn                   ),
+            .up_to_mc         ( cxlip2iafu_to_mc_axi4[ch]  ),
+            .up_from_mc       ( iafu2cxlip_from_mc_axi4[ch]),
+            .dn_to_mc         ( iafu2mc_to_mc_axi4[ch]     ),
+            .dn_from_mc       ( mc2iafu_from_mc_axi4[ch]   ),
+            .stall_addr       ( csr_stall_addr             ),
+            .stall_target_en  ( csr_target_en              ),
+            .stall_en         ( csr_stall_en               ),
+            .stall_cycles     ( csr_stall_cycles           ),
+            .occupancy        ( eng_occ[ch]                ),
+            .max_occupancy    ( eng_max[ch]                ),
+            .stall_events     ( eng_events[ch]             ),
+            .fifo_full_sticky ( eng_full[ch]               ),
+            .bypass_sticky    ( eng_byp[ch]                ),
+            .arid_seen        ( eng_arid[ch]               ),
+            .conflict_cycles  ( eng_confl[ch]              )
+          );
+        end
+      endgenerate
 
-          for (int i = 0; i < MC_CHANNEL; i++) begin
-              // 1. Check if this channel's read address matches the CSR target
-              ar_match[i] = csr_stall_en && 
-                (((cxlip2iafu_to_mc_axi4[i].araddr >> 6) == (csr_stall_addr  >> 6)) || 
-                ((cxlip2iafu_to_mc_axi4[i].araddr >> 6) == (csr_stall_addr1 >> 6)));
-              // 2. Force stall if currently counting, OR if matched but haven't finished stalling
-              force_stall[i] = stalling[i] || (ar_match[i] && cxlip2iafu_to_mc_axi4[i].arvalid && !stall_done[i]);
-
-              // 3. Override the AXI handshake if forced
-              if (force_stall[i]) begin
-                  iafu2mc_to_mc_axi4[i].arvalid      = 1'b0;
-                  iafu2cxlip_from_mc_axi4[i].arready = 1'b0;
-              end
-          end
-      end
-
-      // Timer State Machine
-      always_ff @(posedge afu_clk or negedge afu_rstn) begin
-          if (!afu_rstn) begin // Reset all channels
-              for (int i = 0; i < MC_CHANNEL; i++) begin
-                  stall_counter[i] <= '0;
-                  stalling[i]      <= 1'b0;
-                  stall_done[i]    <= 1'b0;
-              end
-          end else begin
-              for (int i = 0; i < MC_CHANNEL; i++) begin
-                  // 1. Start the stall timer for this specific channel
-                  if (!stalling[i] && !stall_done[i] && ar_match[i] && cxlip2iafu_to_mc_axi4[i].arvalid) begin
-                      stalling[i]      <= 1'b1;
-                      stall_counter[i] <= csr_stall_cycles;
-                  end 
-                  // 2. Countdown logic
-                  else if (stalling[i]) begin
-                      if (stall_counter[i] > 16'd1) begin
-                          stall_counter[i] <= stall_counter[i] - 1'b1;
-                      end else begin
-                          stalling[i]   <= 1'b0;
-                          stall_done[i] <= 1'b1; 
-                      end
-                  end
-                  
-                  // 3. Clear the done flag once the AXI transaction successfully completes
-                  if (stall_done[i] && cxlip2iafu_to_mc_axi4[i].arvalid && mc2iafu_from_mc_axi4[i].arready) begin
-                      stall_done[i] <= 1'b0;
-                  end
-                  else if (stall_done[i] && !cxlip2iafu_to_mc_axi4[i].arvalid) begin
-                      stall_done[i] <= 1'b0;
-                  end
-              end
-          end
-      end
+      // status word:
+      //   [7:0]   occupancy now
+      //   [15:8]  max occupancy since last clear
+      //   [31:16] stall events since last clear (saturating)
+      //   [32]    queue-full sticky
+      //   [33]    bypass sticky: a target was forwarded unstalled
+      //           because every slot was busy
+      //   [35:34] reserved, 0
+      //   [39:36] STALL_FIFO_DEPTH of this bitstream (constant; 0 means
+      //           an older bitstream without this field)
+      //   [47:40] sticky OR of every ARID seen
+      //   [63:48] cycles a same-ID request waited behind a held entry
+      //           (saturating)
+      // index of channel 1, clamped so the reference stays legal when
+      // MC_CHANNEL == 1 (the ternary below discards it in that case)
+      localparam int CH1 = (MC_CHANNEL > 1) ? 1 : 0;
+      localparam logic [3:0] DEPTH_FIELD = 4'(STALL_FIFO_DEPTH);
 
       always_comb begin
-          stall_active   = '0;
-          concurrent_now = '0;
-          for (int i = 0; i < MC_CHANNEL; i++) begin
-              stall_active[i] = stalling[i];
-              if (stalling[i]) concurrent_now = concurrent_now + 4'd1;
-          end
+        csr_status_ch0 = { eng_confl[0], eng_arid[0], DEPTH_FIELD, 2'h0,
+                           eng_byp[0], eng_full[0], eng_events[0], eng_max[0],
+                           eng_occ[0] };
+        csr_status_ch1 = (MC_CHANNEL > 1)
+                       ? { eng_confl[CH1], eng_arid[CH1], DEPTH_FIELD, 2'h0,
+                           eng_byp[CH1], eng_full[CH1], eng_events[CH1], eng_max[CH1],
+                           eng_occ[CH1] }
+                       : 64'h0;
       end
 
-      always_comb begin
-          csr_occupancy = 64'h0;
-          csr_occupancy[MC_CHANNEL-1:0] = stall_active;
-          csr_occupancy[11:8]           = max_concurrent;
-          for (int i = 0; i < (MC_CHANNEL > 2 ? 2 : MC_CHANNEL); i++)
-              csr_occupancy[(16*i)+16 +: 16] = stall_events[i];
-      end
-
-      always_ff @(posedge afu_clk or negedge afu_rstn) begin
-          if (!afu_rstn) begin
-              max_concurrent <= '0;
-              for (int i = 0; i < MC_CHANNEL; i++) stall_events[i] <= '0;
-          end
-          else if (!csr_stall_en) begin        // software clears by disarming
-              max_concurrent <= '0;
-              for (int i = 0; i < MC_CHANNEL; i++) stall_events[i] <= '0;
-          end
-          else begin
-              if (concurrent_now > max_concurrent)
-                  max_concurrent <= concurrent_now;
-              for (int i = 0; i < MC_CHANNEL; i++) begin
-                  if (!stalling[i] && !stall_done[i] && ar_match[i] &&
-                      cxlip2iafu_to_mc_axi4[i].arvalid)
-                      stall_events[i] <= stall_events[i] + 16'd1;
-              end
-          end
-      end
 `else
-assign csr_occupancy = 64'h0;
+assign csr_status_ch0 = 64'h0;
+assign csr_status_ch1 = 64'h0;
 assign iafu2cxlip_ready_eclk                = mc2iafu_ready_eclk             ;
 assign iafu2cxlip_read_poison_eclk          = mc2iafu_read_poison_eclk       ;
 assign iafu2cxlip_readdatavalid_eclk        = mc2iafu_readdatavalid_eclk     ;

@@ -27,7 +27,9 @@
 // EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 
-module ex_default_csr_avmm_slave(
+module ex_default_csr_avmm_slave
+  import afu_stall_pkg::*;
+(
  
 // AVMM Slave Interface
    input               clk,
@@ -43,11 +45,12 @@ module ex_default_csr_avmm_slave(
    output logic        waitrequest,
 
    //newly added ports for CXL stall design
-   output logic [63:0] csr_stall_addr,
+   output logic [STALL_NUM_TARGETS-1:0][63:0] csr_stall_addr,
+   output logic [STALL_NUM_TARGETS-1:0]       csr_target_en,
    output logic        csr_stall_en,
    output logic [15:0] csr_stall_cycles,
-   output logic [63:0] csr_stall_addr1,
-   input  logic [63:0] csr_occupancy
+   input  logic [63:0] csr_status_ch0,
+   input  logic [63:0] csr_status_ch1
 );
 
 
@@ -71,36 +74,47 @@ module ex_default_csr_avmm_slave(
 
 
 //Write logic
+//
+//  0x1000        stall_addr[0]
+//  0x1008        bit0 = stall_en, bits16:1 = stall_cycles
+//  0x1010        stall_addr[1]
+//  0x1018        target-enable bitmask (resets to all ones)
+//  0x1100 + 8*t  stall_addr[t], full array
+//
 always @(posedge clk) begin
     if (!reset_n) begin
-        csr_test_reg <= 32'h0;
-        csr_stall_addr   <= 64'h0;
+        csr_test_reg     <= 32'h0;
+        csr_stall_addr   <= '0;
+        csr_target_en    <= '1;
         csr_stall_en     <= 1'b0;
         csr_stall_cycles <= 16'd0;
-        csr_stall_addr1  <= 64'h0;
     end
-    else begin
-         if (write && (address == 22'h0000) && ~poison) begin 
-           csr_test_reg <= (writedata[31:0] & mask[31:0]) | (csr_test_reg & ~mask[31:0]);
+    else if (write && ~poison) begin
+         if (address[21:0] == 22'h000000) begin
+            csr_test_reg <= (writedata[31:0] & mask[31:0]) |
+                            (csr_test_reg & ~mask[31:0]);
          end
-         else if (write && (address[21:0] == 22'h001000) && ~poison) begin
-            csr_stall_addr <= writedata;
+         else if (address[21:0] == 22'h001000) begin
+            csr_stall_addr[0] <= writedata;
          end
-         else if (write && (address[21:0] == 22'h001008) && ~poison) begin
+         else if (address[21:0] == 22'h001008) begin
             csr_stall_en     <= writedata[0];
             csr_stall_cycles <= writedata[16:1];
          end
-         else if (write && (address[21:0] == 22'h001010) && ~poison) begin
-            csr_stall_addr1 <= writedata;
+         else if (address[21:0] == 22'h001010) begin
+            csr_stall_addr[1] <= writedata;
+         end
+         else if (address[21:0] == 22'h001018) begin
+            csr_target_en <= writedata[STALL_NUM_TARGETS-1:0];
          end
          else begin
-            csr_test_reg <= csr_test_reg;
+            for (int t = 0; t < STALL_NUM_TARGETS; t++)
+               if (address == (32'h00001100 + t*8))
+                  csr_stall_addr[t] <= writedata;
          end
-                
-    end    
-end 
+    end
+end
 
-//Read logic 
 always @(posedge clk) begin
     if (!reset_n) begin
         readdata <= 64'h0;
@@ -111,15 +125,23 @@ always @(posedge clk) begin
         else if ((address[20:0] == 21'h00E00) && config_access)
             readdata <= EX_CAP_HEADER & mask;
         else if (address[21:0] == 22'h001000)
-            readdata <= csr_stall_addr & mask;
+            readdata <= csr_stall_addr[0] & mask;
         else if (address[21:0] == 22'h001008)
             readdata <= {47'h0, csr_stall_cycles, csr_stall_en} & mask;
         else if (address[21:0] == 22'h001010)
-            readdata <= csr_stall_addr1 & mask;
+            readdata <= csr_stall_addr[1] & mask;
+        else if (address[21:0] == 22'h001018)
+            readdata <= {{(64-STALL_NUM_TARGETS){1'b0}}, csr_target_en} & mask;
         else if (address[21:0] == 22'h001020)
-            readdata <= csr_occupancy & mask;
-        else
+            readdata <= csr_status_ch0 & mask;
+        else if (address[21:0] == 22'h001028)
+            readdata <= csr_status_ch1 & mask;
+        else begin
             readdata <= 64'h0;
+            for (int t = 0; t < STALL_NUM_TARGETS; t++)
+               if (address == (32'h00001100 + t*8))
+                  readdata <= csr_stall_addr[t] & mask;
+        end
     end
 end
 
